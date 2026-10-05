@@ -9,7 +9,17 @@ import type { Reading } from '../types/reading'
 import type { Operation } from '../types/operation'
 import type { Mlf } from '../types/mlf'
 import type { Tasting } from '../types/tasting'
-import { db, DB_NAME, DB_SCHEMA_VERSION, listOperations, listReadings, listTastings } from './db'
+import type { CleaningRelease } from '../types/cleaning'
+import {
+  db,
+  DB_NAME,
+  DB_SCHEMA_VERSION,
+  getCleaningByOccupant,
+  getCleaningBySourceBatch,
+  listOperations,
+  listReadings,
+  listTastings
+} from './db'
 import { abvFromSg, gravityDeclinePerDay, isOverTemp, potentialAbv } from './gravity'
 import { nowIso } from './uuid'
 
@@ -21,6 +31,10 @@ export interface BatchArchive {
   batch: Batch
   parcel: Parcel | null
   tank: Tank | null
+  /** 入罐时被本批次占用的清洗放行单（入罐时罐位已达清洗标准的凭据） */
+  cleaningRelease: CleaningRelease | null
+  /** 本批次出罐后为罐位开启的下一张放行单（追溯到下一轮清洗；未出罐为 null） */
+  nextCleaningRelease: CleaningRelease | null
   readings: Reading[]
   operations: Operation[]
   mlf: Mlf | null
@@ -47,14 +61,17 @@ export interface BatchArchive {
 export async function buildBatchArchive(batchId: string): Promise<BatchArchive> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出档案')
-  const [parcel, tank, allReadings, allOperations, mlf, allTastings] = await Promise.all([
-    batch.parcelId ? db.parcels.get(batch.parcelId) : Promise.resolve(undefined),
-    batch.tankId ? db.tanks.get(batch.tankId) : Promise.resolve(undefined),
-    listReadings(),
-    listOperations(),
-    db.mlfs.where('batchId').equals(batchId).first(),
-    listTastings()
-  ])
+  const [parcel, tank, allReadings, allOperations, mlf, allTastings, cleaningRelease, nextCleaningRelease] =
+    await Promise.all([
+      batch.parcelId ? db.parcels.get(batch.parcelId) : Promise.resolve(undefined),
+      batch.tankId ? db.tanks.get(batch.tankId) : Promise.resolve(undefined),
+      listReadings(),
+      listOperations(),
+      db.mlfs.where('batchId').equals(batchId).first(),
+      listTastings(),
+      getCleaningByOccupant(batchId),
+      batch.state === '已出罐' ? getCleaningBySourceBatch(batchId) : Promise.resolve(null)
+    ])
   const readings = allReadings.filter((row) => row.batchId === batchId)
   const operations = allOperations.filter((row) => row.batchId === batchId)
   const tastings = allTastings.filter((row) => row.batchId === batchId)
@@ -80,6 +97,8 @@ export async function buildBatchArchive(batchId: string): Promise<BatchArchive> 
     batch: stripRevision(batch),
     parcel: parcel ? stripRevision(parcel) : null,
     tank: tank ? stripRevision(tank) : null,
+    cleaningRelease: cleaningRelease ? stripRevision(cleaningRelease) : null,
+    nextCleaningRelease: nextCleaningRelease ? stripRevision(nextCleaningRelease) : null,
     readings: readings.map(stripRevision),
     operations: operations.map(stripRevision),
     mlf: mlf ? stripRevision(mlf) : null,

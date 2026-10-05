@@ -8,12 +8,14 @@ import { computed } from 'vue'
 import type { Component } from 'vue'
 import {
   CircleCheck,
+  CircleCheckFilled,
   Clock,
   Grape,
   Loading,
   Remove,
   Sunny,
-  Timer
+  Timer,
+  WarningFilled
 } from '@element-plus/icons-vue'
 
 type Tone = 'primary' | 'success' | 'warning' | 'danger' | 'info'
@@ -50,7 +52,10 @@ const STYLES: Record<string, StageStyle> = {
   结束: { tone: 'info', icon: CircleCheck, color: '#7a8b99' },
   空闲: { tone: 'success', icon: CircleCheck, color: '#3f8f6b' },
   在用: { tone: 'warning', icon: Grape, color: '#c9863c' },
-  清洗中: { tone: 'info', icon: Timer, color: '#7a8b99' }
+  待清洗: { tone: 'danger', icon: WarningFilled, color: '#cf5c5c' },
+  清洗中: { tone: 'info', icon: Timer, color: '#7a8b99' },
+  已放行: { tone: 'success', icon: CircleCheckFilled, color: '#3f8f6b' },
+  已占用: { tone: 'warning', icon: Grape, color: '#c9863c' }
 }
 
 const style = computed<StageStyle>(

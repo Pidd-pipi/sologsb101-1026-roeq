@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** /tanks 发酵罐容量配置与罐位状态看板：按材质与温控方式筛选并校验占用冲突 */
+/** /tanks 发酵罐容量配置与罐位状态看板：状态由清洗放行链派生，按材质 / 温控筛选 */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -8,7 +8,14 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, updateBatch, type BatchRow, type ParcelRow, type TankRow } from '@/utils/db'
+import {
+  db,
+  TankGateError,
+  type BatchRow,
+  type CleaningRow,
+  type ParcelRow,
+  type TankRow
+} from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useTankStore } from '@/stores/tankStore'
 import {
@@ -16,8 +23,7 @@ import {
   TANK_STATES,
   TANK_TEMP_CONTROLS,
   createEmptyTank,
-  type Tank,
-  type TankState
+  type Tank
 } from '@/types/tank'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
 import { filtersToQuery } from '@/utils/query'
@@ -32,6 +38,9 @@ const { rows: tanks, ready } = useIdbTable<TankRow>(() => db.tanks, {
 })
 const { rows: batches } = useIdbTable<BatchRow>(() => db.batches)
 const { rows: parcels } = useIdbTable<ParcelRow>(() => db.parcels)
+const { rows: cleanings } = useIdbTable<CleaningRow>(() => db.cleanings, {
+  compare: (a, b) => b.updatedAt - a.updatedAt
+})
 
 const selects: FilterSelectConfig[] = [
   { key: 'materials', label: '材质', options: TANK_MATERIALS.map((item) => ({ label: item, value: item })) },
@@ -48,6 +57,36 @@ function batchLabel(batch: BatchRow | null): string {
   if (!batch) return '—'
   const parcel = parcels.value.find((item) => item.id === batch.parcelId)
   return `${parcel ? parcel.name : '未知地块'} · ${batch.volumeL}L`
+}
+
+const latestReleaseMap = computed(() => {
+  const map = new Map<string, CleaningRow>()
+  for (const row of cleanings.value) {
+    const existing = map.get(row.tankId)
+    if (!existing || row.updatedAt > existing.updatedAt) map.set(row.tankId, row)
+  }
+  return map
+})
+
+function latestRelease(tankId: string): CleaningRow | null {
+  return latestReleaseMap.value.get(tankId) ?? null
+}
+
+function releaseHint(tank: TankRow): string {
+  const release = latestRelease(tank.id)
+  switch (tank.state) {
+    case '在用':
+      return `已被入罐批次占用${release?.releasedAt ? `（放行于 ${release.releasedAt.slice(0, 10)}）` : ''}`
+    case '空闲':
+      return '清洗已放行，可分配新批次'
+    case '清洗中':
+      return '清洗放行未完成，不可分配'
+    case '待清洗':
+    default:
+      return release?.note?.includes('旧数据升级')
+        ? '旧数据升级：缺放行记录，待重新清洗'
+        : '出罐待清洗，完成碱洗/消毒/冲洗后才放行'
+  }
 }
 
 const filtered = computed(() => {
@@ -72,10 +111,11 @@ const totals = computed(() => {
     .reduce((sum, tank) => sum + tank.capacityL, 0)
   return {
     tankCount: tanks.value.length,
+    freeCount: tanks.value.filter((tank) => tank.state === '空闲').length,
+    dirtyCount: tanks.value.filter((tank) => tank.state === '待清洗' || tank.state === '清洗中').length,
     totalCapacity,
     usedCapacity,
-    usageRatio: totalCapacity > 0 ? Math.round((usedCapacity / totalCapacity) * 100) : 0,
-    freeCount: tanks.value.filter((tank) => tank.state === '空闲').length
+    usageRatio: totalCapacity > 0 ? Math.round((usedCapacity / totalCapacity) * 100) : 0
   }
 })
 
@@ -83,7 +123,12 @@ const totals = computed(() => {
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
-const form = reactive<Omit<Tank, 'id'>>(createEmptyTank())
+const form = reactive<Omit<Tank, 'id' | 'state'>>(baseForm())
+
+function baseForm(): Omit<Tank, 'id' | 'state'> {
+  const { code, material, capacityL, tempControl } = createEmptyTank()
+  return { code, material, capacityL, tempControl }
+}
 
 const rules: FormRules = {
   code: [{ required: true, message: '请填写罐号', trigger: 'blur' }],
@@ -92,7 +137,7 @@ const rules: FormRules = {
 
 function openCreate(): void {
   editingId.value = null
-  Object.assign(form, createEmptyTank())
+  Object.assign(form, baseForm())
   dialogVisible.value = true
 }
 
@@ -102,8 +147,7 @@ function openEdit(tank: TankRow): void {
     code: tank.code,
     material: tank.material,
     capacityL: tank.capacityL,
-    tempControl: tank.tempControl,
-    state: tank.state
+    tempControl: tank.tempControl
   })
   dialogVisible.value = true
 }
@@ -113,10 +157,10 @@ async function submit(): Promise<void> {
   if (!valid) return
   if (editingId.value) {
     await store.updateTank(editingId.value, { ...form })
-    ElMessage.success('罐位配置已更新')
+    ElMessage.success('罐位配置已更新（罐位状态由清洗放行流程决定）')
   } else {
     await store.createTank({ ...form })
-    ElMessage.success('发酵罐已建档')
+    ElMessage.success('发酵罐已建档，罐位初始为「待清洗」')
   }
   dialogVisible.value = false
 }
@@ -128,7 +172,7 @@ async function remove(tank: TankRow): Promise<void> {
     return
   }
   try {
-    await ElMessageBox.confirm(`确认删除发酵罐「${tank.code}」？`, '删除确认', {
+    await ElMessageBox.confirm(`确认删除发酵罐「${tank.code}」？其清洗放行记录将一并删除。`, '删除确认', {
       type: 'warning',
       confirmButtonText: '确认删除'
     })
@@ -139,16 +183,7 @@ async function remove(tank: TankRow): Promise<void> {
   ElMessage.success('发酵罐已删除')
 }
 
-async function changeState(tank: TankRow, next: TankState): Promise<void> {
-  try {
-    await store.changeState(tank, next)
-    ElMessage.success(`罐 ${tank.code} 已置为「${next}」`)
-  } catch (error) {
-    ElMessage.warning(error instanceof Error ? error.message : '操作失败')
-  }
-}
-
-/** 为该罐分配一个在罐批次（真实占用冲突校验） */
+/** 为该罐分配一个在罐批次（事务内校验清洗放行门槛与并发占用） */
 async function assignBatch(tank: TankRow): Promise<void> {
   const candidates = batches.value.filter((batch) => batch.state !== '已出罐' && batch.tankId !== tank.id)
   if (candidates.length === 0) {
@@ -158,7 +193,7 @@ async function assignBatch(tank: TankRow): Promise<void> {
   try {
     const { value } = await ElMessageBox.prompt(
       `可分配批次：\n${candidates.map((batch) => `${batch.id}（${batchLabel(batch)}）`).join('\n')}`,
-      `为罐 ${tank.code} 分配批次`,
+      `为罐 ${tank.code} 分配批次（需已完成清洗放行）`,
       { inputPlaceholder: '粘贴批次 id', confirmButtonText: '分配', cancelButtonText: '取消' }
     )
     const picked = candidates.find((batch) => batch.id === value.trim())
@@ -166,13 +201,23 @@ async function assignBatch(tank: TankRow): Promise<void> {
       ElMessage.error('批次 id 不存在，请重新选择')
       return
     }
-    await store.ensureAssignable(tank.id, picked.id)
-    await store.updateTank(tank.id, { state: '在用' })
-    await updateBatch(picked.id, { tankId: tank.id })
-    ElMessage.success('罐位已分配')
+    await store.assign(tank.id, picked.id)
+    ElMessage.success('罐位已占用，清洗放行单随批次归档')
   } catch (error) {
-    if (error instanceof Error && error.message) ElMessage.warning(error.message)
+    if (error instanceof TankGateError) {
+      ElMessage.error(
+        error.failedSteps.length > 0
+          ? `罐 ${tank.code} 清洗未达标：${error.failedSteps.join('、')}，请先到清洗放行台补录`
+          : error.message
+      )
+    } else if (error instanceof Error && error.message) {
+      ElMessage.warning(error.message)
+    }
   }
+}
+
+function gotoCleaning(tank: TankRow): void {
+  void router.push({ path: ROUTES.cleaning, query: { tankId: tank.id } })
 }
 
 function onFilterChange(next: FilterModel): void {
@@ -197,9 +242,12 @@ watch(
     <div class="page__head">
       <div>
         <h2 class="page__title">发酵罐容量配置与罐位看板</h2>
-        <p class="page__subtitle">罐位「在用」由入罐批次绑定后自动置位；重复分配会被拦截并列出占用批次。</p>
+        <p class="page__subtitle">
+          罐位随「出罐 → 清洗放行 → 入罐」自动流转：出罐即待清洗，三步合格放行后才能分配新批次。
+        </p>
       </div>
       <div>
+        <el-button type="success" plain @click="router.push(ROUTES.cleaning)">去清洗放行台</el-button>
         <el-button @click="router.push(ROUTES.batches)">去入罐登记</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增发酵罐</el-button>
       </div>
@@ -207,8 +255,8 @@ watch(
 
     <div class="badge-row">
       <StatBadge label="罐总数" :value="totals.tankCount" suffix="个" icon="Grid" tone="primary" />
-      <StatBadge label="空闲罐位" :value="totals.freeCount" suffix="个" icon="Files" tone="success" />
-      <StatBadge label="总容量" :value="totals.totalCapacity" suffix="L" icon="Histogram" tone="info" />
+      <StatBadge label="已放行可入罐" :value="totals.freeCount" suffix="个" icon="Files" tone="success" />
+      <StatBadge label="待清洗/清洗中" :value="totals.dirtyCount" suffix="个" icon="WarningFilled" tone="danger" />
       <StatBadge label="已占用容量" :value="totals.usedCapacity" suffix="L" icon="DataLine" tone="warning" />
       <StatBadge label="罐容利用率" :value="totals.usageRatio" :percent="totals.usageRatio" show-percent tone="danger" icon="PieChart" />
     </div>
@@ -225,7 +273,7 @@ watch(
       <template #header>
         <div class="card-title">
           <span>罐位清单（{{ filtered.length }} / {{ tanks.length }}）</span>
-          <span class="muted">占用冲突校验：同一在罐批次不可占用两个罐位</span>
+          <span class="muted">未完成清洗放行的罐位不能分配给新批次</span>
         </div>
       </template>
 
@@ -238,34 +286,32 @@ watch(
       />
 
       <el-table v-else :data="filtered" stripe border>
-        <el-table-column prop="code" label="罐号" width="110" />
-        <el-table-column prop="material" label="材质" width="110" />
-        <el-table-column prop="capacityL" label="容量(L)" width="110" align="right" />
-        <el-table-column prop="tempControl" label="温控方式" width="110" />
-        <el-table-column label="罐位状态" width="130">
+        <el-table-column prop="code" label="罐号" width="100" />
+        <el-table-column prop="material" label="材质" width="90" />
+        <el-table-column prop="capacityL" label="容量(L)" width="100" align="right" />
+        <el-table-column prop="tempControl" label="温控" width="90" />
+        <el-table-column label="罐位状态" width="110">
           <template #default="{ row }">
             <StageTag :value="row.state" />
           </template>
         </el-table-column>
-        <el-table-column label="占用批次" min-width="200">
+        <el-table-column label="清洗放行" min-width="230">
+          <template #default="{ row }">
+            <div class="release-cell">
+              <span>{{ releaseHint(row) }}</span>
+              <el-button link type="primary" size="small" @click="gotoCleaning(row)">查看 / 录入清洗</el-button>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="占用批次" min-width="180">
           <template #default="{ row }">
             <span v-if="occupancyOf(row.id)">{{ batchLabel(occupancyOf(row.id)) }}</span>
             <span v-else class="muted">未占用</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="320" fixed="right">
+        <el-table-column label="操作" width="210" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" :disabled="row.state === '在用'" @click="assignBatch(row)">分配批次</el-button>
-            <el-button
-              v-if="row.state !== '清洗中'"
-              link
-              type="warning"
-              :disabled="occupancyOf(row.id) !== null"
-              @click="changeState(row, '清洗中')"
-            >
-              转清洗
-            </el-button>
-            <el-button v-else link type="success" @click="changeState(row, '空闲')">清洗完成</el-button>
+            <el-button link type="primary" :disabled="row.state !== '空闲'" @click="assignBatch(row)">分配批次</el-button>
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" @click="remove(row)">删除</el-button>
           </template>
@@ -292,9 +338,8 @@ watch(
           </el-select>
         </el-form-item>
         <el-form-item label="罐位状态">
-          <el-select v-model="form.state" class="full">
-            <el-option v-for="item in TANK_STATES" :key="item" :label="item" :value="item" />
-          </el-select>
+          <el-tag type="danger" effect="plain">新罐默认「待清洗」</el-tag>
+          <span class="muted state-tip">状态由清洗放行流程自动流转，不可手工修改</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -308,5 +353,18 @@ watch(
 <style scoped>
 .full {
   width: 100%;
+}
+
+.release-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.state-tip {
+  margin-left: 8px;
+  font-size: 12px;
 }
 </style>

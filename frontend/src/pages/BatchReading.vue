@@ -8,10 +8,10 @@ import StageTag from '@/components/common/StageTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
-import { db, type BatchRow, type ParcelRow, type ReadingRow, type TankRow } from '@/utils/db'
+import { db, type BatchRow, type CleaningRow, type ParcelRow, type ReadingRow, type TankRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useFermentTrend } from '@/hooks/useFermentTrend'
-import { useBatchStore } from '@/stores/batchStore'
+import { useBatchStore, BatchSubmitError } from '@/stores/batchStore'
 import { BATCH_STATES, createEmptyBatch, type Batch } from '@/types/batch'
 import { OVER_TEMP_C, createEmptyReading, type Reading } from '@/types/reading'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
@@ -29,6 +29,9 @@ const { rows: readings } = useIdbTable<ReadingRow>(() => db.readings, {
 })
 const { rows: parcels } = useIdbTable<ParcelRow>(() => db.parcels)
 const { rows: tanks } = useIdbTable<TankRow>(() => db.tanks)
+const { rows: cleanings } = useIdbTable<CleaningRow>(() => db.cleanings, {
+  compare: (a, b) => b.updatedAt - a.updatedAt
+})
 
 const selects = computed<FilterSelectConfig[]>(() => [
   { key: 'states', label: '批次状态', options: BATCH_STATES.map((item) => ({ label: item, value: item })) },
@@ -100,21 +103,73 @@ const batchRules: FormRules = {
   volumeL: [{ required: true, message: '请填写入罐量', trigger: 'blur' }]
 }
 
-/** 可选罐位：状态非「清洗中」，且未被其它在罐批次占用 */
+/** 罐位最新放行单映射，入罐选择罐位时只列已放行（空闲）且无在罐批次占用的罐 */
+const latestReleaseMap = computed(() => {
+  const map = new Map<string, CleaningRow>()
+  for (const row of cleanings.value) {
+    const existing = map.get(row.tankId)
+    if (!existing || row.updatedAt > existing.updatedAt) map.set(row.tankId, row)
+  }
+  return map
+})
+
+/** 可选罐位：最新放行单「已放行」且未被其它在罐批次占用；待清洗 / 清洗中罐位不可选 */
 const assignableTanks = computed(() =>
   tanks.value.filter((tank) => {
-    if (tank.state === '清洗中') return false
+    if (tank.state !== '空闲') return false
     const occupied = batches.value.some(
       (batch) => batch.tankId === tank.id && batch.state !== '已出罐' && batch.id !== store.currentBatchId
     )
-    return !occupied
+    if (occupied) return false
+    const release = latestReleaseMap.value.get(tank.id)
+    return !!release && release.state === '已放行'
   })
 )
+
+/** 不可选罐位给出原因，帮助班组判断该去完成哪一步 */
+function tankUnavailableReason(tank: TankRow): string {
+  if (tank.state === '在用') return '在用'
+  const release = latestReleaseMap.value.get(tank.id)
+  if (!release || tank.state === '待清洗') return '待清洗'
+  if (tank.state === '清洗中') {
+    const failed = (['碱洗', '消毒', '冲洗'] as const)
+      .filter((kind) => release?.steps.filter((s) => s.kind === kind && s.state !== '失效').at(-1)?.state !== '合格')
+      .join(' / ')
+    return failed ? `清洗中：${failed} 未达标` : '清洗中'
+  }
+  return ''
+}
+
+/** 入罐草稿：跨标签页竞争失败后保留，localStorage 兜底刷新丢失 */
+const DRAFT_KEY = 'gbwinetank-batch-draft'
+const draftConflict = ref<{ message: string; failedSteps: string[]; occupied: boolean } | null>(null)
+
+function loadDraft(): void {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY)
+    if (!raw) return
+    const draft = JSON.parse(raw) as Partial<ReturnType<typeof createEmptyBatch>>
+    if (draft && typeof draft === 'object') Object.assign(batchForm, draft)
+  } catch {
+    // 草稿损坏直接忽略
+  }
+}
+
+function persistDraft(): void {
+  localStorage.setItem(DRAFT_KEY, JSON.stringify(batchForm))
+}
+
+function clearDraft(): void {
+  localStorage.removeItem(DRAFT_KEY)
+  draftConflict.value = null
+}
 
 function openCreateBatch(): void {
   Object.assign(batchForm, createEmptyBatch())
   const parcelFromQuery = typeof route.query.parcelId === 'string' ? route.query.parcelId : ''
   if (parcelFromQuery) batchForm.parcelId = parcelFromQuery
+  loadDraft()
+  draftConflict.value = null
   batchDialog.value = true
 }
 
@@ -123,24 +178,38 @@ async function submitBatch(): Promise<void> {
   if (!valid) return
   try {
     await store.createBatch({ ...batchForm })
-    ElMessage.success('批次已入罐，罐位置为「在用」')
+    ElMessage.success('批次已入罐，清洗放行单已被本批次占用')
+    clearDraft()
     batchDialog.value = false
   } catch (error) {
+    // 跨标签页竞争 / 放行未达标：对话框不关、表单草稿保留，并指出失效步骤
+    persistDraft()
+    if (error instanceof BatchSubmitError) {
+      draftConflict.value = {
+        message: error.message,
+        failedSteps: error.failedSteps,
+        occupied: error.occupied
+      }
+    }
     ElMessage.error(error instanceof Error ? error.message : '入罐失败')
   }
 }
 
 async function shipBatch(batch: BatchRow): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认批次 ${batch.id} 出罐？出罐后将自动释放罐位并归档读数。`, '出罐确认', {
-      type: 'warning',
-      confirmButtonText: '确认出罐'
-    })
+    await ElMessageBox.confirm(
+      `确认批次 ${batch.id} 出罐？出罐后罐位进入「待清洗」，需完成碱洗 / 消毒 / 冲洗并放行后才能分配新批次。`,
+      '出罐确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认出罐'
+      }
+    )
   } catch {
     return
   }
   await store.ship(batch.id)
-  ElMessage.success('批次已出罐，罐位已释放')
+  ElMessage.success('批次已出罐，罐位已进入待清洗并生成清洗放行单')
 }
 
 async function removeBatch(batch: BatchRow): Promise<void> {
@@ -382,7 +451,20 @@ watch(currentBatch, (batch) => {
       </el-col>
     </el-row>
 
-    <el-dialog v-model="batchDialog" title="新建入罐批次" width="560px">
+    <el-dialog v-model="batchDialog" title="新建入罐批次" width="560px" :close-on-click-modal="false">
+      <el-alert
+        v-if="draftConflict"
+        :type="draftConflict.occupied ? 'error' : 'warning'"
+        :closable="false"
+        show-icon
+        class="mb"
+        :title="draftConflict.occupied ? '罐位已被另一方占用，入罐草稿已保留' : '清洗放行未通过，入罐草稿已保留'"
+        :description="
+          draftConflict.occupied
+            ? draftConflict.message
+            : `失效 / 未达标步骤：${draftConflict.failedSteps.join('、') || '碱洗、消毒、冲洗'}。请通知班组到清洗放行台重做后，再用本草稿提交。`
+        "
+      />
       <el-form ref="batchFormRef" :model="batchForm" :rules="batchRules" label-width="100px">
         <el-form-item label="地块" prop="parcelId">
           <el-select v-model="batchForm.parcelId" class="full" placeholder="选择地块">
@@ -390,14 +472,35 @@ watch(currentBatch, (batch) => {
           </el-select>
         </el-form-item>
         <el-form-item label="发酵罐" prop="tankId">
-          <el-select v-model="batchForm.tankId" class="full" placeholder="仅列出可分配罐位">
+          <el-select
+            v-model="batchForm.tankId"
+            class="full"
+            placeholder="仅列出已完成清洗放行的罐位"
+            @change="draftConflict = null"
+          >
             <el-option
               v-for="item in assignableTanks"
               :key="item.id"
-              :label="`${item.code} · ${item.material} ${item.capacityL}L`"
+              :label="`${item.code} · ${item.material} ${item.capacityL}L（已放行可入罐）`"
               :value="item.id"
             />
+            <template #empty>
+              <div class="tank-empty">没有已放行罐位，请先到清洗放行台完成碱洗 / 消毒 / 冲洗</div>
+            </template>
           </el-select>
+          <div v-if="batchForm.tankId && !assignableTanks.some((t) => t.id === batchForm.tankId)" class="tank-stale">
+            所选罐位的放行状态已变化（可能在其它标签页被占用或放行被打回），请重新选择罐位
+          </div>
+          <div class="tank-gates">
+            <el-tooltip
+              v-for="tank in tanks.filter((t) => !assignableTanks.some((a) => a.id === t.id)).slice(0, 4)"
+              :key="tank.id"
+              :content="`罐 ${tank.code}：${tankUnavailableReason(tank)}`"
+              placement="top"
+            >
+              <el-tag size="small" type="info" effect="plain">{{ tank.code }} {{ tankUnavailableReason(tank) }}</el-tag>
+            </el-tooltip>
+          </div>
         </el-form-item>
         <el-form-item label="采收日期">
           <el-date-picker v-model="batchForm.harvestDate" type="date" value-format="YYYY-MM-DD" class="full" />
@@ -410,8 +513,16 @@ watch(currentBatch, (batch) => {
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="batchDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitBatch">确认入罐</el-button>
+        <el-button
+          @click="
+            () => {
+              clearDraft()
+              batchDialog = false
+            }
+          "
+          >取消</el-button
+        >
+        <el-button type="primary" @click="submitBatch">确认入罐（占用放行单）</el-button>
       </template>
     </el-dialog>
 
@@ -499,5 +610,24 @@ watch(currentBatch, (batch) => {
 
 .batch-item__actions {
   margin-top: 4px;
+}
+
+.tank-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #a9792b;
+}
+
+.tank-stale {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #cf5c5c;
+}
+
+.tank-gates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 </style>
