@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** /batches 入罐登记与发酵读数录入：逐日比重/温度/糖度趋势与超温标记 */
+/** /batches 入罐登记与发酵读数录入：入罐须凭清洗放行，逐日比重/温度/糖度趋势与超温标记 */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -8,7 +8,7 @@ import StageTag from '@/components/common/StageTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
-import { db, type BatchRow, type ParcelRow, type ReadingRow, type TankRow } from '@/utils/db'
+import { db, type BatchRow, type CleaningRow, type ParcelRow, type ReadingRow, type TankRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useFermentTrend } from '@/hooks/useFermentTrend'
 import { useBatchStore } from '@/stores/batchStore'
@@ -29,6 +29,7 @@ const { rows: readings } = useIdbTable<ReadingRow>(() => db.readings, {
 })
 const { rows: parcels } = useIdbTable<ParcelRow>(() => db.parcels)
 const { rows: tanks } = useIdbTable<TankRow>(() => db.tanks)
+const { rows: cleanings } = useIdbTable<CleaningRow>(() => db.cleanings)
 
 const selects = computed<FilterSelectConfig[]>(() => [
   { key: 'states', label: '批次状态', options: BATCH_STATES.map((item) => ({ label: item, value: item })) },
@@ -92,7 +93,7 @@ function barHeight(gravity: number): number {
 /* ------------------------------ 入罐登记 ------------------------------ */
 const batchDialog = ref(false)
 const batchFormRef = ref<FormInstance>()
-const batchForm = reactive<Omit<Batch, 'id' | 'lastOperationAt'>>(createEmptyBatch())
+const batchForm = reactive<Omit<Batch, 'id' | 'cleaningId' | 'lastOperationAt'>>(createEmptyBatch())
 
 const batchRules: FormRules = {
   parcelId: [{ required: true, message: '请选择地块', trigger: 'change' }],
@@ -100,16 +101,31 @@ const batchRules: FormRules = {
   volumeL: [{ required: true, message: '请填写入罐量', trigger: 'blur' }]
 }
 
-/** 可选罐位：状态非「清洗中」，且未被其它在罐批次占用 */
+/** 该罐最新清洗放行记录 */
+function latestCleaning(tankId: string): CleaningRow | null {
+  const rows = cleanings.value.filter((item) => item.tankId === tankId)
+  return rows.sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
+}
+
+/** 可选罐位：清洗已放行（罐位空闲），且未被其它在罐批次占用 */
 const assignableTanks = computed(() =>
   tanks.value.filter((tank) => {
-    if (tank.state === '清洗中') return false
+    if (tank.state !== '空闲') return false
+    const release = latestCleaning(tank.id)
+    if (!release || release.state !== '已放行') return false
     const occupied = batches.value.some(
       (batch) => batch.tankId === tank.id && batch.state !== '已出罐' && batch.id !== store.currentBatchId
     )
     return !occupied
   })
 )
+
+/** 罐位选项标签：附放行时间，便于班组核对清洗放行的时效 */
+function tankOptionLabel(tank: TankRow): string {
+  const release = latestCleaning(tank.id)
+  const releasedAt = release?.releasedAt ? release.releasedAt.slice(0, 16).replace('T', ' ') : '—'
+  return `${tank.code} · ${tank.material} ${tank.capacityL}L · 已放行 ${releasedAt}`
+}
 
 function openCreateBatch(): void {
   Object.assign(batchForm, createEmptyBatch())
@@ -123,24 +139,32 @@ async function submitBatch(): Promise<void> {
   if (!valid) return
   try {
     await store.createBatch({ ...batchForm })
-    ElMessage.success('批次已入罐，罐位置为「在用」')
+    ElMessage.success('批次已入罐，清洗放行记录已归档到该批次，罐位置为「在用」')
     batchDialog.value = false
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '入罐失败')
+    // 占用冲突 / 放行失效：保留表单草稿，明确指出失效步骤，班组可改选罐位后重试
+    await ElMessageBox.alert(error instanceof Error ? error.message : '入罐失败', '入罐未成功，草稿已保留', {
+      confirmButtonText: '知道了',
+      type: 'warning'
+    })
   }
 }
 
 async function shipBatch(batch: BatchRow): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认批次 ${batch.id} 出罐？出罐后将自动释放罐位并归档读数。`, '出罐确认', {
-      type: 'warning',
-      confirmButtonText: '确认出罐'
-    })
+    await ElMessageBox.confirm(
+      `确认批次 ${batch.id} 出罐？出罐后罐位将转「待清洗」，需完成 碱洗 → 消毒 → 冲洗 三步放行后才能再次分配。`,
+      '出罐确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认出罐'
+      }
+    )
   } catch {
     return
   }
   await store.ship(batch.id)
-  ElMessage.success('批次已出罐，罐位已释放')
+  ElMessage.success('批次已出罐，罐位已转「待清洗」并生成清洗放行记录')
 }
 
 async function removeBatch(batch: BatchRow): Promise<void> {
@@ -390,11 +414,11 @@ watch(currentBatch, (batch) => {
           </el-select>
         </el-form-item>
         <el-form-item label="发酵罐" prop="tankId">
-          <el-select v-model="batchForm.tankId" class="full" placeholder="仅列出可分配罐位">
+          <el-select v-model="batchForm.tankId" class="full" placeholder="仅列出清洗已放行的罐位">
             <el-option
               v-for="item in assignableTanks"
               :key="item.id"
-              :label="`${item.code} · ${item.material} ${item.capacityL}L`"
+              :label="tankOptionLabel(item)"
               :value="item.id"
             />
           </el-select>

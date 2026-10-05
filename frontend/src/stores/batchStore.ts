@@ -1,5 +1,7 @@
 /**
  * 入罐批次 store：维护在罐批次、当前选中批次与地块/罐绑定校验。
+ * 入罐 / 改绑在单个事务内完成「校验清洗放行 + 占用罐位 + 消费放行」，
+ * 两个标签页同时提交时只有一方成功，另一方收到含失效步骤的错误并保留草稿。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
@@ -8,15 +10,12 @@ import type { Batch } from '@/types/batch'
 import type { FilterModel } from '@/types/filter'
 import type { BatchRow } from '@/utils/db'
 import {
-  assertTankAssignable,
-  putBatch,
+  assignBatchToTank,
+  createBatchInTank,
   removeBatch,
   shipBatch as shipBatchRow,
-  updateBatch as updateBatchRow,
-  updateTank,
-  ROW_REVISION
+  updateBatch as updateBatchRow
 } from '@/utils/db'
-import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
 export const BATCH_FILTER_KEYS = ['states', 'parcelIds']
@@ -46,27 +45,29 @@ export const useBatchStore = defineStore('batch', () => {
     currentBatchId.value = id
   }
 
-  /** 入罐登记：先校验罐位可分配，再把罐置为「在用」 */
-  async function createBatch(payload: Omit<Batch, 'id' | 'lastOperationAt'>): Promise<string> {
+  /** 入罐登记：事务内校验清洗放行并占用罐位；冲突 / 未放行时抛错，调用方保留表单草稿 */
+  async function createBatch(payload: Omit<Batch, 'id' | 'cleaningId' | 'lastOperationAt'>): Promise<string> {
     error.value = null
     if (!payload.parcelId) throw new Error('请选择地块')
     if (!payload.tankId) throw new Error('请选择发酵罐')
-    await assertTankAssignable(payload.tankId, null)
-    const now = Date.now()
-    const id = createId('batch')
-    await putBatch({ ...payload, id, lastOperationAt: null, revision: ROW_REVISION, createdAt: now, updatedAt: now })
-    await updateTank(payload.tankId, { state: '在用' })
-    currentBatchId.value = id
-    return id
+    try {
+      const id = await createBatchInTank(payload)
+      currentBatchId.value = id
+      return id
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '入罐失败'
+      throw err
+    }
   }
 
-  /** 改绑罐位：校验新罐可用后再释放旧罐 */
+  /** 改绑罐位：新罐需已放行（事务内消费），旧罐自动转待清洗 */
   async function updateBatch(id: string, patch: Partial<Batch>, current: BatchRow): Promise<void> {
     error.value = null
     if (patch.tankId && patch.tankId !== current.tankId) {
-      await assertTankAssignable(patch.tankId, id)
-      await updateTank(patch.tankId, { state: '在用' })
-      if (current.tankId) await updateTank(current.tankId, { state: '空闲' })
+      await assignBatchToTank(id, patch.tankId)
+      const { tankId: _tankId, ...rest } = patch
+      if (Object.keys(rest).length > 0) await updateBatchRow(id, rest)
+      return
     }
     await updateBatchRow(id, patch)
   }
@@ -76,7 +77,7 @@ export const useBatchStore = defineStore('batch', () => {
     if (currentBatchId.value === id) currentBatchId.value = null
   }
 
-  /** 出罐：释放罐位并归档批次 */
+  /** 出罐：批次归档，罐位转「待清洗」并新建清洗放行记录 */
   async function ship(id: string): Promise<void> {
     await shipBatchRow(id)
   }

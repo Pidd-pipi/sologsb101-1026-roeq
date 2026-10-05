@@ -1,6 +1,7 @@
 /**
  * 批次档案 JSON 序列化与校验
  * 品评页用于导出单批次完整档案，也是「导入导出备份」的数据校验入口。
+ * 档案包含入罐时消费的清洗放行记录，可回溯当时是否达到清洗标准。
  */
 import type { Batch } from '../types/batch'
 import type { Parcel } from '../types/parcel'
@@ -9,6 +10,7 @@ import type { Reading } from '../types/reading'
 import type { Operation } from '../types/operation'
 import type { Mlf } from '../types/mlf'
 import type { Tasting } from '../types/tasting'
+import { cleaningQualified, type CleaningRecord } from '../types/cleaning'
 import { db, DB_NAME, DB_SCHEMA_VERSION, listOperations, listReadings, listTastings } from './db'
 import { abvFromSg, gravityDeclinePerDay, isOverTemp, potentialAbv } from './gravity'
 import { nowIso } from './uuid'
@@ -21,6 +23,8 @@ export interface BatchArchive {
   batch: Batch
   parcel: Parcel | null
   tank: Tank | null
+  /** 入罐时消费的清洗放行记录（旧数据批次为 null） */
+  cleaning: CleaningRecord | null
   readings: Reading[]
   operations: Operation[]
   mlf: Mlf | null
@@ -40,6 +44,8 @@ export interface BatchArchive {
     overTempDays: number
     /** 最优品评结论 */
     bestVerdict: string
+    /** 入罐时清洗是否达到放行标准 */
+    cleaningPassed: boolean
   }
 }
 
@@ -47,9 +53,10 @@ export interface BatchArchive {
 export async function buildBatchArchive(batchId: string): Promise<BatchArchive> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出档案')
-  const [parcel, tank, allReadings, allOperations, mlf, allTastings] = await Promise.all([
+  const [parcel, tank, cleaning, allReadings, allOperations, mlf, allTastings] = await Promise.all([
     batch.parcelId ? db.parcels.get(batch.parcelId) : Promise.resolve(undefined),
     batch.tankId ? db.tanks.get(batch.tankId) : Promise.resolve(undefined),
+    batch.cleaningId ? db.cleanings.get(batch.cleaningId) : Promise.resolve(undefined),
     listReadings(),
     listOperations(),
     db.mlfs.where('batchId').equals(batchId).first(),
@@ -80,6 +87,7 @@ export async function buildBatchArchive(batchId: string): Promise<BatchArchive> 
     batch: stripRevision(batch),
     parcel: parcel ? stripRevision(parcel) : null,
     tank: tank ? stripRevision(tank) : null,
+    cleaning: cleaning ? stripRevision(cleaning) : null,
     readings: readings.map(stripRevision),
     operations: operations.map(stripRevision),
     mlf: mlf ? stripRevision(mlf) : null,
@@ -91,7 +99,8 @@ export async function buildBatchArchive(batchId: string): Promise<BatchArchive> 
       potentialAbv: first ? potentialAbv(first.gravity) : 0,
       estimatedAbv: first && last ? abvFromSg(first.gravity, last.gravity) : 0,
       overTempDays: readings.filter((row) => isOverTemp(row.tempC)).length,
-      bestVerdict
+      bestVerdict,
+      cleaningPassed: cleaning ? cleaningQualified(cleaning) : false
     }
   }
 }

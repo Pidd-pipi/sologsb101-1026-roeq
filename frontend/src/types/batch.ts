@@ -16,6 +16,8 @@ export interface Batch {
   brix: number
   /** 批次状态 */
   state: BatchState
+  /** 入罐时消费的清洗放行记录 id（旧数据为 null，批次档案据此追溯清洗是否达标） */
+  cleaningId: string | null
   /** 最近一次作业时间（由作业完成回写） */
   lastOperationAt: string | null
 }
@@ -27,7 +29,7 @@ export function isBatchActive(batch: Pick<Batch, 'state'>): boolean {
   return batch.state !== '已出罐'
 }
 
-export function createEmptyBatch(): Omit<Batch, 'id' | 'lastOperationAt'> {
+export function createEmptyBatch(): Omit<Batch, 'id' | 'cleaningId' | 'lastOperationAt'> {
   return {
     parcelId: '',
     tankId: '',

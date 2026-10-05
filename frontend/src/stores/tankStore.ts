@@ -1,14 +1,23 @@
 /**
- * 发酵罐 store：维护罐位占用、容量筛选条件与占用冲突校验。
+ * 发酵罐 store：维护罐位占用、容量筛选条件与清洗放行流程。
+ * 罐位状态不再允许手工直接改写，统一由 出罐 / 清洗步骤 / 放行 / 入罐 流程驱动。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
-import type { Tank, TankState } from '@/types/tank'
+import type { Tank } from '@/types/tank'
+import type { CleaningStepName } from '@/types/cleaning'
 import type { FilterModel } from '@/types/filter'
-import type { BatchRow, TankRow } from '@/utils/db'
-import { assertTankAssignable, putTank, removeTank, updateTank as updateTankRow, ROW_REVISION } from '@/utils/db'
-import { createId } from '@/utils/uuid'
+import type { BatchRow } from '@/utils/db'
+import {
+  assignBatchToTank,
+  recordCleaningStep,
+  registerTank,
+  releaseCleaning,
+  removeTank,
+  startCleaning,
+  updateTank as updateTankRow
+} from '@/utils/db'
 import { queryToFilters } from '@/utils/query'
 
 export const TANK_FILTER_KEYS = ['materials', 'tempControls', 'states']
@@ -39,20 +48,9 @@ export const useTankStore = defineStore('tank', () => {
     return batches.find((batch) => batch.tankId === tankId && batch.state !== '已出罐') ?? null
   }
 
-  /** 分配前校验：罐位空闲且未被其它在罐批次占用 */
-  async function ensureAssignable(tankId: string, batchId: string | null): Promise<void> {
-    busy.value = true
-    try {
-      await assertTankAssignable(tankId, batchId)
-    } finally {
-      busy.value = false
-    }
-  }
-
-  async function createTank(payload: Omit<Tank, 'id'>): Promise<string> {
-    const now = Date.now()
-    const id = createId('tank')
-    await putTank({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+  /** 新罐建档：初始「待清洗」，完成三步清洗放行后才可分配 */
+  async function createTank(payload: Omit<Tank, 'id' | 'state'>): Promise<string> {
+    const id = await registerTank(payload)
     selectedId.value = id
     return id
   }
@@ -66,12 +64,39 @@ export const useTankStore = defineStore('tank', () => {
     if (selectedId.value === id) selectedId.value = null
   }
 
-  /** 罐位状态流转（空闲 ⇄ 清洗中）；置为「在用」需由批次绑定触发 */
-  async function changeState(tank: TankRow, next: TankState): Promise<void> {
-    if (next === '在用') {
-      throw new Error('罐位「在用」由入罐批次绑定后自动置位，请到入罐登记页分配批次')
+  /** 罐位还没有清洗记录时补建空记录（兜底入口） */
+  async function beginCleaning(tankId: string): Promise<string> {
+    return startCleaning(tankId)
+  }
+
+  /** 记录 / 更正清洗步骤；更正会使后续步骤立即失效并撤销已放行状态 */
+  async function recordStep(cleaningId: string, step: CleaningStepName, value: number, operator: string): Promise<void> {
+    busy.value = true
+    try {
+      await recordCleaningStep(cleaningId, step, value, operator)
+    } finally {
+      busy.value = false
     }
-    await updateTankRow(tank.id, { state: next })
+  }
+
+  /** 三步全部达标后放行，罐位转「空闲」 */
+  async function release(cleaningId: string): Promise<void> {
+    busy.value = true
+    try {
+      await releaseCleaning(cleaningId)
+    } finally {
+      busy.value = false
+    }
+  }
+
+  /** 把在罐批次分配到该罐（事务内校验放行与占用，失败时抛出含失效步骤的错误） */
+  async function assignBatch(batchId: string, tankId: string): Promise<void> {
+    busy.value = true
+    try {
+      await assignBatchToTank(batchId, tankId)
+    } finally {
+      busy.value = false
+    }
   }
 
   return {
@@ -83,10 +108,12 @@ export const useTankStore = defineStore('tank', () => {
     applyQuery,
     select,
     occupancyOf,
-    ensureAssignable,
     createTank,
     updateTank,
     deleteTank,
-    changeState
+    beginCleaning,
+    recordStep,
+    release,
+    assignBatch
   }
 })

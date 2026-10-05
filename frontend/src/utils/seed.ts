@@ -1,9 +1,11 @@
 /**
  * 首次打开应用时灌入的演示数据
- * 只在 parcels 表为空时执行，地块 → 发酵罐 → 批次 → 读数/作业/苹乳/品评 三层互相引用，
+ * 只在 parcels 表为空时执行，地块 → 发酵罐 → 批次 → 读数/作业/苹乳/品评/清洗放行 互相引用，
  * 保证 6 个页面第一次进入都有可点通的内容。函数本身幂等：由调用方判定表是否为空。
+ * 清洗放行演示覆盖四种形态：已消费（在罐批次）、已放行（空闲可分配）、清洗中且冲洗未达标、
+ * 以及出罐后新建的待清洗空记录。
  */
-import type { ParcelRow, TankRow, BatchRow, ReadingRow, OperationRow, MlfRow, TastingRow } from './db'
+import type { ParcelRow, TankRow, BatchRow, ReadingRow, OperationRow, MlfRow, TastingRow, CleaningRow } from './db'
 import { db, ROW_REVISION } from './db'
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
@@ -32,6 +34,7 @@ const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
     volumeL: 2600,
     brix: 24.5,
     state: '酒精发酵',
+    cleaningId: 'cl-001',
     lastOperationAt: '2024-09-18T09:20:00.000Z'
   },
   {
@@ -42,6 +45,7 @@ const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
     volumeL: 2000,
     brix: 23,
     state: '苹乳发酵',
+    cleaningId: 'cl-002',
     lastOperationAt: '2024-09-27T14:05:00.000Z'
   },
   {
@@ -52,6 +56,7 @@ const BATCHES: Array<Omit<BatchRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
     volumeL: 1400,
     brix: 21.5,
     state: '已出罐',
+    cleaningId: 'cl-005',
     lastOperationAt: '2024-10-08T08:40:00.000Z'
   }
 ]
@@ -117,11 +122,91 @@ const TASTINGS: Array<Omit<TastingRow, 'revision' | 'createdAt' | 'updatedAt'>> 
   }
 ]
 
-/** 灌入演示数据（地块 → 罐 → 批次 → 读数/作业/苹乳/品评） */
+/** 清洗放行演示：已消费（在罐）/ 已放行（可分配）/ 清洗中（冲洗未达标）/ 出罐后已消费的历史记录。
+ *  显式给出 createdAt/updatedAt：同一罐存在多条历史记录时，「最新记录」按创建时间判定，必须稳定。 */
+const CLEANINGS: Array<Omit<CleaningRow, 'revision'>> = [
+  {
+    id: 'cl-001',
+    tankId: 'tk-001',
+    fromBatchId: null,
+    toBatchId: 'b-001',
+    state: '已消费',
+    releasedAt: '2024-09-10T08:30:00.000Z',
+    createdAt: Date.parse('2024-09-09T09:00:00.000Z'),
+    updatedAt: Date.parse('2024-09-12T08:00:00.000Z'),
+    steps: [
+      { step: '碱洗', value: 2.2, passed: true, operator: '陈岩', recordedAt: '2024-09-09T09:00:00.000Z', invalidated: false },
+      { step: '消毒', value: 120, passed: true, operator: '陈岩', recordedAt: '2024-09-09T11:00:00.000Z', invalidated: false },
+      { step: '冲洗', value: 7.1, passed: true, operator: '林沐', recordedAt: '2024-09-10T08:30:00.000Z', invalidated: false }
+    ]
+  },
+  {
+    id: 'cl-002',
+    tankId: 'tk-002',
+    fromBatchId: null,
+    toBatchId: 'b-002',
+    state: '已消费',
+    releasedAt: '2024-09-13T10:00:00.000Z',
+    createdAt: Date.parse('2024-09-12T09:30:00.000Z'),
+    updatedAt: Date.parse('2024-09-15T08:00:00.000Z'),
+    steps: [
+      { step: '碱洗', value: 2.0, passed: true, operator: '周亦', recordedAt: '2024-09-12T09:30:00.000Z', invalidated: false },
+      { step: '消毒', value: 100, passed: true, operator: '周亦', recordedAt: '2024-09-12T14:00:00.000Z', invalidated: false },
+      { step: '冲洗', value: 7.4, passed: true, operator: '许澜', recordedAt: '2024-09-13T10:00:00.000Z', invalidated: false }
+    ]
+  },
+  {
+    id: 'cl-003',
+    tankId: 'tk-003',
+    fromBatchId: 'b-003',
+    toBatchId: null,
+    state: '已放行',
+    releasedAt: '2024-10-10T09:00:00.000Z',
+    createdAt: Date.parse('2024-10-09T08:40:00.000Z'),
+    updatedAt: Date.parse('2024-10-10T09:00:00.000Z'),
+    steps: [
+      { step: '碱洗', value: 2.5, passed: true, operator: '林沐', recordedAt: '2024-10-09T08:40:00.000Z', invalidated: false },
+      { step: '消毒', value: 150, passed: true, operator: '林沐', recordedAt: '2024-10-09T13:20:00.000Z', invalidated: false },
+      { step: '冲洗', value: 7.0, passed: true, operator: '陈岩', recordedAt: '2024-10-10T09:00:00.000Z', invalidated: false }
+    ]
+  },
+  {
+    id: 'cl-004',
+    tankId: 'tk-004',
+    fromBatchId: null,
+    toBatchId: null,
+    state: '清洗中',
+    releasedAt: null,
+    createdAt: Date.parse('2024-10-11T09:10:00.000Z'),
+    updatedAt: Date.parse('2024-10-12T16:00:00.000Z'),
+    steps: [
+      { step: '碱洗', value: 2.8, passed: true, operator: '周亦', recordedAt: '2024-10-11T09:10:00.000Z', invalidated: false },
+      { step: '消毒', value: 110, passed: true, operator: '周亦', recordedAt: '2024-10-11T11:30:00.000Z', invalidated: false },
+      { step: '冲洗', value: 9.2, passed: false, operator: '许澜', recordedAt: '2024-10-12T16:00:00.000Z', invalidated: false }
+    ]
+  },
+  {
+    id: 'cl-005',
+    tankId: 'tk-003',
+    fromBatchId: null,
+    toBatchId: 'b-003',
+    state: '已消费',
+    releasedAt: '2024-09-19T08:00:00.000Z',
+    createdAt: Date.parse('2024-09-18T09:00:00.000Z'),
+    updatedAt: Date.parse('2024-09-20T08:00:00.000Z'),
+    steps: [
+      { step: '碱洗', value: 1.8, passed: true, operator: '陈岩', recordedAt: '2024-09-18T09:00:00.000Z', invalidated: false },
+      { step: '消毒', value: 90, passed: true, operator: '陈岩', recordedAt: '2024-09-18T15:00:00.000Z', invalidated: false },
+      { step: '冲洗', value: 7.6, passed: true, operator: '林沐', recordedAt: '2024-09-19T08:00:00.000Z', invalidated: false }
+    ]
+  }
+]
+
+/** 灌入演示数据（地块 → 罐 → 批次 → 读数/作业/苹乳/品评/清洗放行） */
 export async function seedDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.parcels, db.tanks, db.batches, db.readings, db.operations, db.mlfs, db.tastings],
+    [db.parcels, db.tanks, db.batches, db.readings, db.operations, db.mlfs, db.tastings, db.cleanings],
     async () => {
       await db.parcels.bulkPut(PARCELS.map(rev))
       await db.tanks.bulkPut(TANKS.map(rev))
@@ -130,6 +215,7 @@ export async function seedDatabase(): Promise<void> {
       await db.operations.bulkPut(OPERATIONS.map(rev))
       await db.mlfs.bulkPut(MLFS.map(rev))
       await db.tastings.bulkPut(TASTINGS.map(rev))
+      await db.cleanings.bulkPut(CLEANINGS.map((row) => ({ ...row, revision: ROW_REVISION })))
     }
   )
 }
